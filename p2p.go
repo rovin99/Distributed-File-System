@@ -23,14 +23,19 @@ const (
 // Message represents a basic message
 type Message struct {
     Type string      `json:"type"`
-    Data interface{} `json:"data"`
+    Data json.RawMessage `json:"data"`
 }
 
 // NewMessage creates a new message
 func NewMessage(t MessageType, data interface{}) *Message {
+    dataJSON, err := json.Marshal(data)
+    if err != nil {
+        return nil
+
+    }
     return &Message{
         Type: string(t),
-        Data: data,
+        Data: dataJSON,
     }
 }
 

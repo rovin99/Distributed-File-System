@@ -1,11 +1,17 @@
 package main
 
 import (
-    "encoding/json"
-    "fmt"
-    "net"
-    "sync"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
 )
+
 // ChunkRequest represents a request for a specific chunk
 type ChunkRequest struct {
 	Hash string `json:"hash"`
@@ -101,165 +107,206 @@ func (n *P2PNode) GetListenAddr() string {
     return n.listenAddr
 }
 
+
+
+// Add a helper function to send messages reliably
+func sendMessage(conn net.Conn, msg *Message) error {
+    // Set write deadline
+    if err := conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+        return fmt.Errorf("failed to set write deadline: %v", err)
+    }
+    
+    // Create an encoder for the connection
+    encoder := json.NewEncoder(conn)
+    if err := encoder.Encode(msg); err != nil {
+        return fmt.Errorf("failed to encode message: %v", err)
+    }
+    
+    return nil
+}
+
+// Add a helper function to receive messages reliably
+func receiveMessage(conn net.Conn) (*Message, error) {
+    // Set read deadline
+    if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+        return nil, fmt.Errorf("failed to set read deadline: %v", err)
+    }
+    
+    var msg Message
+    decoder := json.NewDecoder(conn)
+    if err := decoder.Decode(&msg); err != nil {
+        if err == io.EOF {
+            return nil, fmt.Errorf("connection closed by peer")
+        }
+        return nil, fmt.Errorf("failed to decode message: %v", err)
+    }
+    
+    return &msg, nil
+}
 // HandleConnection handles incoming connections
 func (n *P2PNode) handleConnection(conn net.Conn) {
-	n.connMgr.AddConnection(conn)
-	defer func() {
-		n.connMgr.RemoveConnection(conn)
-		conn.Close()
-	}()
+    n.connMgr.AddConnection(conn)
+    defer func() {
+        n.connMgr.RemoveConnection(conn)
+        conn.Close()
+    }()
 
-	for {
-		var msg Message
-		decoder := json.NewDecoder(conn)
-		if err := decoder.Decode(&msg); err != nil {
-			fmt.Printf("Failed to decode message: %v\n", err)
-			return
-		}
+    for {
+        msg, err := receiveMessage(conn)
+        if err != nil {
+            if !strings.Contains(err.Error(), "timeout") {
+                fmt.Printf("Connection handler error: %v\n", err)
+            }
+            return
+        }
 
-		switch MessageType(msg.Type) {
-		case FileRequest:
-			n.handleFileRequest(conn, msg.Data)
-		case "ChunkRequest":
-			n.handleChunkRequest(conn, msg.Data)
-		}
-	}
+        switch MessageType(msg.Type) {
+        case FileRequest:
+            var fileName string
+            if err := json.Unmarshal(msg.Data, &fileName); err != nil {
+                fmt.Printf("Failed to unmarshal file request: %v\n", err)
+                continue
+            }
+            n.handleFileRequest(conn, fileName)
+            
+        case "ChunkRequest":
+            var request ChunkRequest
+            if err := json.Unmarshal(msg.Data, &request); err != nil {
+                fmt.Printf("Failed to unmarshal chunk request: %v\n", err)
+                continue
+            }
+            n.handleChunkRequest(conn, request)
+        }
+    }
 }
 
 // HandleFileRequest handles file requests
-func (n *P2PNode) handleFileRequest(conn net.Conn, data interface{}) {
-	fileName, ok := data.(string)
-	if !ok {
-		fmt.Printf("Invalid file request data\n")
-		return
-	}
+func (n *P2PNode) handleFileRequest(conn net.Conn, fileName string) {
+    // Read metadata
+    metadata, err := n.storage.readMetadata(fileName)
+    if err != nil {
+        fmt.Printf("Failed to read metadata: %v\n", err)
+        return
+    }
 
-	// Read metadata
-	metadata, err := n.storage.readMetadata(fileName)
-	if err != nil {
-		fmt.Printf("Failed to read metadata: %v\n", err)
-		return
-	}
-
-	// Send metadata response
-	response := NewMessage(FileResponse, metadata)
-	encoder := json.NewEncoder(conn)
-	if err := encoder.Encode(response); err != nil {
-		fmt.Printf("Failed to send metadata response: %v\n", err)
-		return
-	}
+    // Send metadata response
+    response := NewMessage(FileResponse, metadata)
+    if err := sendMessage(conn, response); err != nil {
+        fmt.Printf("Failed to send metadata response: %v\n", err)
+        return
+    }
 }
 
 // HandleChunkRequest handles chunk requests
-func (n *P2PNode) handleChunkRequest(conn net.Conn, data interface{}) {
-	request, ok := data.(ChunkRequest)
-	if !ok {
-		fmt.Printf("Invalid chunk request data\n")
-		return
-	}
+func (n *P2PNode) handleChunkRequest(conn net.Conn, request ChunkRequest) {
+    // Validate hash
+    if request.Hash == "" {
+        fmt.Printf("Empty hash in chunk request\n")
+        return
+    }
 
-	// Read chunk data
-	chunkData, err := n.storage.readChunk(request.Hash)
-	if err != nil {
-		fmt.Printf("Failed to read chunk: %v\n", err)
-		return
-	}
+    // Read chunk data
+    chunkPath := filepath.Join(n.storage.basePath, request.Hash)
+    chunkData, err := os.ReadFile(chunkPath)
+    if err != nil {
+        fmt.Printf("Failed to read chunk %s: %v\n", request.Hash, err)
+        return
+    }
 
-	// Send chunk response
-	chunkDataBytes, ok := chunkData.([]byte)
-	if !ok {
-		fmt.Printf("Invalid chunk data type\n")
-		return
-	}
-	response := NewMessage(FileResponse, ChunkResponse{
-		Hash: request.Hash,
-		Data: chunkDataBytes,
-	})
-	encoder := json.NewEncoder(conn)
-	if err := encoder.Encode(response); err != nil {
-		fmt.Printf("Failed to send chunk response: %v\n", err)
-		return
-	}
+    // Send chunk response
+    response := NewMessage(FileResponse, ChunkResponse{
+        Hash: request.Hash,
+        Data: chunkData,
+    })
+
+    if err := sendMessage(conn, response); err != nil {
+        fmt.Printf("Failed to send chunk response: %v\n", err)
+        return
+    }
+}
+
+// Update the requestChunk method to handle the response properly
+func (n *P2PNode) requestChunk(peerAddr string, hash string) error {
+    conn, err := net.Dial("tcp", peerAddr)
+    if err != nil {
+        return fmt.Errorf("failed to connect to peer: %v", err)
+    }
+    defer conn.Close()
+
+    // Create and send chunk request
+    request := NewMessage("ChunkRequest", ChunkRequest{Hash: hash})
+    if err := sendMessage(conn, request); err != nil {
+        return fmt.Errorf("failed to send chunk request: %v", err)
+    }
+
+    // Receive chunk response
+    response, err := receiveMessage(conn)
+    if err != nil {
+        return fmt.Errorf("failed to receive chunk response: %v", err)
+    }
+
+    // Parse chunk response
+    var chunkResponse ChunkResponse
+    if err := json.Unmarshal(response.Data, &chunkResponse); err != nil {
+        return fmt.Errorf("failed to unmarshal chunk response: %v", err)
+    }
+
+    // Verify hash matches
+    if chunkResponse.Hash != hash {
+        return fmt.Errorf("received chunk hash %s doesn't match requested hash %s", 
+            chunkResponse.Hash, hash)
+    }
+
+    // Store chunk
+    if err := n.storage.storeChunk(hash, chunkResponse.Data); err != nil {
+        return fmt.Errorf("failed to store chunk: %v", err)
+    }
+
+    return nil
+}
+
+func (n *P2PNode) verifyChunk(hash string) error {
+    chunkPath := filepath.Join(n.storage.basePath, hash)
+    _, err := os.Stat(chunkPath)
+    if err != nil {
+        return fmt.Errorf("chunk %s not found: %v", hash, err)
+    }
+    return nil
 }
 
 // RequestFile requests a file from a peer
 func (n *P2PNode) RequestFile(peerAddr string, fileName string) error {
-	conn, err := net.Dial("tcp", peerAddr)
-	if err != nil {
-		return fmt.Errorf("failed to connect to peer: %v", err)
-	}
-	defer conn.Close()
+    conn, err := net.Dial("tcp", peerAddr)
+    if err != nil {
+        return fmt.Errorf("failed to connect to peer: %v", err)
+    }
+    defer conn.Close()
 
-	// Send file request
-	request := NewMessage(FileRequest, fileName)
-	encoder := json.NewEncoder(conn)
-	if err := encoder.Encode(request); err != nil {
-		return fmt.Errorf("failed to send file request: %v", err)
-	}
+    // Send file request
+    request := NewMessage(FileRequest, fileName)
+    if err := sendMessage(conn, request); err != nil {
+        return fmt.Errorf("failed to send file request: %v", err)
+    }
 
-	// Receive metadata response
-	var response Message
-	decoder := json.NewDecoder(conn)
-	if err := decoder.Decode(&response); err != nil {
-		return fmt.Errorf("failed to receive metadata response: %v", err)
-	}
+    // Receive metadata response
+    response, err := receiveMessage(conn)
+    if err != nil {
+        return fmt.Errorf("failed to receive metadata response: %v", err)
+    }
 
-	// Parse metadata
-	var metadata FileMetadata
-	metadataBytes, err := json.Marshal(response.Data)
-	if err != nil {
-		return fmt.Errorf("failed to marshal metadata: %v", err)
-	}
-	if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
-		return fmt.Errorf("failed to unmarshal metadata: %v", err)
-	}
+    // Parse metadata
+    var metadata FileMetadata
+    if err := json.Unmarshal(response.Data, &metadata); err != nil {
+        return fmt.Errorf("failed to unmarshal metadata: %v", err)
+    }
 
-	// Request each chunk
-	for _, hash := range metadata.ChunkHashes {
-		if err := n.requestChunk(peerAddr, hash); err != nil {
-			return fmt.Errorf("failed to request chunk %s: %v", hash, err)
-		}
-	}
+    // Request each chunk using a new connection
+    for _, hash := range metadata.ChunkHashes {
+        if err := n.requestChunk(peerAddr, hash); err != nil {
+            return fmt.Errorf("failed to request chunk %s: %v", hash, err)
+        }
+    }
 
-	return nil
+    return nil
 }
 
-// RequestChunk requests a chunk from a peer
-func (n *P2PNode) requestChunk(peerAddr string, hash string) error {
-	conn, err := net.Dial("tcp", peerAddr)
-	if err != nil {
-		return fmt.Errorf("failed to connect to peer: %v", err)
-	}
-	defer conn.Close()
-	// Send chunk request
-	request := NewMessage("ChunkRequest", ChunkRequest{Hash: hash})
-	encoder := json.NewEncoder(conn)
-	if err := encoder.Encode(request); err != nil {
-		fmt.Printf("Failed to send chunk request: %v\n", err)
-		
-	}
-
-	// Receive chunk response
-	var response Message
-	decoder := json.NewDecoder(conn)
-	if err := decoder.Decode(&response); err != nil {
-		return fmt.Errorf("failed to receive chunk response: %v", err)
-	}
-
-	// Parse chunk response
-	var chunkResponse ChunkResponse
-	chunkBytes, err := json.Marshal(response.Data)
-	if err != nil {
-		return fmt.Errorf("failed to marshal chunk response: %v", err)
-	}
-	if err := json.Unmarshal(chunkBytes, &chunkResponse); err != nil {
-		return fmt.Errorf("failed to unmarshal chunk response: %v", err)
-	}
-
-	// Store chunk
-	if err := n.storage.storeChunk(hash, chunkResponse.Data); err != nil {
-		return fmt.Errorf("failed to store chunk: %v", err)
-	}
-
-	return nil
-}
